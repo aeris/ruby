@@ -15,7 +15,6 @@ static inline void
 pass_passed_block_handler(rb_execution_context_t *ec)
 {
     VALUE block_handler = rb_vm_frame_block_handler(ec->cfp);
-    vm_block_handler_verify(block_handler);
     vm_passed_block_handler_set(ec, block_handler);
     VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_PASSED);
 }
@@ -98,7 +97,7 @@ extern int select_large_fdset(int, fd_set *, fd_set *, fd_set *, struct timeval 
 #define SAVE_ROOT_JMPBUF_AFTER_STMT \
     } \
     __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW ? \
-	      (rb_thread_raised_set(GET_THREAD(), RAISED_STACKOVERFLOW), \
+	      (rb_ec_raised_set(GET_EC(), RAISED_STACKOVERFLOW), \
 	       raise(SIGSEGV), \
 	       EXCEPTION_EXECUTE_HANDLER) : \
 	      EXCEPTION_CONTINUE_SEARCH) { \
@@ -144,10 +143,11 @@ LONG WINAPI rb_w32_stack_overflow_handler(struct _EXCEPTION_POINTERS *);
 
 #define EC_REPUSH_TAG() (void)(_ec->tag = &_tag)
 
-#define PUSH_TAG() EC_PUSH_TAG(GET_EC())
-#define POP_TAG()  EC_POP_TAG()
-
-#if defined __GNUC__ && __GNUC__ == 4 && (__GNUC_MINOR__ >= 6 && __GNUC_MINOR__ <= 8)
+#if defined __GNUC__ && __GNUC__ == 4 && (__GNUC_MINOR__ >= 6 && __GNUC_MINOR__ <= 8) || __clang__
+/* This macro prevents GCC 4.6--4.8 from emitting maybe-uninitialized warnings.
+ * This macro also prevents Clang from dumping core in EC_EXEC_TAG().
+ * (I confirmed Clang 4.0.1 and 5.0.0.)
+ */
 # define VAR_FROM_MEMORY(var) __extension__(*(__typeof__(var) volatile *)&(var))
 # define VAR_INITIALIZED(var) ((var) = VAR_FROM_MEMORY(var))
 # define VAR_NOCLOBBERED(var) volatile var
@@ -157,26 +157,9 @@ LONG WINAPI rb_w32_stack_overflow_handler(struct _EXCEPTION_POINTERS *);
 # define VAR_NOCLOBBERED(var) var
 #endif
 
-#if defined(USE_UNALIGNED_MEMBER_ACCESS) && USE_UNALIGNED_MEMBER_ACCESS && \
-    defined(__clang__)
-# define UNALIGNED_MEMBER_ACCESS(expr) __extension__({ \
-    _Pragma("GCC diagnostic push"); \
-    _Pragma("GCC diagnostic ignored \"-Waddress-of-packed-member\""); \
-    typeof(expr) unaligned_member_access_result = (expr); \
-    _Pragma("GCC diagnostic pop"); \
-    unaligned_member_access_result; \
-})
-#else
-# define UNALIGNED_MEMBER_ACCESS(expr) expr
-#endif
-#define UNALIGNED_MEMBER_PTR(ptr, mem) UNALIGNED_MEMBER_ACCESS(&(ptr)->mem)
-
-#undef RB_OBJ_WRITE
-#define RB_OBJ_WRITE(a, slot, b) UNALIGNED_MEMBER_ACCESS(rb_obj_write((VALUE)(a), (VALUE *)(slot), (VALUE)(b), __FILE__, __LINE__))
-
-/* clear th->ec->tag->state, and return the value */
+/* clear ec->tag->state, and return the value */
 static inline int
-rb_threadptr_tag_state(const rb_execution_context_t *ec)
+rb_ec_tag_state(const rb_execution_context_t *ec)
 {
     enum ruby_tag_type state = ec->tag->state;
     ec->tag->state = TAG_NONE;
@@ -196,14 +179,9 @@ rb_ec_tag_jump(const rb_execution_context_t *ec, enum ruby_tag_type st)
   [ISO/IEC 9899:1999] 7.13.1.1
 */
 #define EC_EXEC_TAG() \
-    (ruby_setjmp(_tag.buf) ? rb_threadptr_tag_state(VAR_FROM_MEMORY(_ec)) : (EC_REPUSH_TAG(), 0))
-
-#define EXEC_TAG() \
-  EC_EXEC_TAG()
+    (ruby_setjmp(_tag.buf) ? rb_ec_tag_state(VAR_FROM_MEMORY(_ec)) : (EC_REPUSH_TAG(), 0))
 
 #define EC_JUMP_TAG(ec, st) rb_ec_tag_jump(ec, st)
-
-#define JUMP_TAG(st) EC_JUMP_TAG(GET_EC(), (st))
 
 #define INTERNAL_EXCEPTION_P(exc) FIXNUM_P(exc)
 
@@ -280,13 +258,13 @@ enum {
     RAISED_STACKOVERFLOW = 2,
     RAISED_NOMEMORY = 4
 };
-int rb_threadptr_set_raised(rb_thread_t *th);
-int rb_threadptr_reset_raised(rb_thread_t *th);
-#define rb_thread_raised_set(th, f)   ((th)->ec->raised_flag |= (f))
-#define rb_thread_raised_reset(th, f) ((th)->ec->raised_flag &= ~(f))
-#define rb_thread_raised_p(th, f)     (((th)->ec->raised_flag & (f)) != 0)
-#define rb_thread_raised_clear(th)    ((th)->ec->raised_flag = 0)
-int rb_threadptr_stack_check(rb_thread_t *th);
+#define rb_ec_raised_set(ec, f)   ((ec)->raised_flag |= (f))
+#define rb_ec_raised_reset(ec, f) ((ec)->raised_flag &= ~(f))
+#define rb_ec_raised_p(ec, f)    (((ec)->raised_flag & (f)) != 0)
+#define rb_ec_raised_clear(ec)    ((ec)->raised_flag = 0)
+int rb_ec_set_raised(rb_execution_context_t *ec);
+int rb_ec_reset_raised(rb_execution_context_t *ec);
+int rb_ec_stack_check(rb_execution_context_t *ec);
 
 VALUE rb_f_eval(int argc, const VALUE *argv, VALUE self);
 VALUE rb_make_exception(int argc, const VALUE *argv);
@@ -299,11 +277,7 @@ NORETURN(void rb_print_undef(VALUE, ID, rb_method_visibility_t));
 NORETURN(void rb_print_undef_str(VALUE, VALUE));
 NORETURN(void rb_print_inaccessible(VALUE, ID, rb_method_visibility_t));
 NORETURN(void rb_vm_localjump_error(const char *,VALUE, int));
-#if 0
 NORETURN(void rb_vm_jump_tag_but_local_jump(int));
-#endif
-NORETURN(void rb_raise_method_missing(rb_thread_t *th, int argc, const VALUE *argv,
-				      VALUE obj, int call_status));
 
 VALUE rb_vm_make_jump_tag_but_local_jump(int state, VALUE val);
 rb_cref_t *rb_vm_cref(void);
@@ -316,7 +290,6 @@ VALUE rb_vm_cbase(void);
 /* vm_backtrace.c */
 VALUE rb_ec_backtrace_object(const rb_execution_context_t *ec);
 VALUE rb_ec_backtrace_str_ary(const rb_execution_context_t *ec, long lev, long n);
-VALUE rb_ec_backtrace_location_ary(const rb_execution_context_t *ec, long lev, long n);
 
 #ifndef CharNext		/* defined as CharNext[AW] on Windows. */
 # ifdef HAVE_MBLEN

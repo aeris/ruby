@@ -9,8 +9,9 @@
 
 **********************************************************************/
 
-#include "internal.h"
+#include "ruby/encoding.h"
 #include "ruby/debug.h"
+#include "internal.h"
 
 #include "vm_core.h"
 #include "eval_intern.h"
@@ -31,14 +32,50 @@ id2str(ID id)
 inline static int
 calc_lineno(const rb_iseq_t *iseq, const VALUE *pc)
 {
-    return rb_iseq_line_no(iseq, pc - iseq->body->iseq_encoded);
+    VM_ASSERT(iseq);
+    VM_ASSERT(iseq->body);
+    VM_ASSERT(iseq->body->iseq_encoded);
+    VM_ASSERT(iseq->body->iseq_size);
+    if (! pc) {
+        /* This can happen during VM bootup. */
+        VM_ASSERT(iseq->body->type == ISEQ_TYPE_TOP);
+        VM_ASSERT(! iseq->body->local_table);
+        VM_ASSERT(! iseq->body->local_table_size);
+        return 0;
+    }
+    else {
+        ptrdiff_t n = pc - iseq->body->iseq_encoded;
+        VM_ASSERT(n <= iseq->body->iseq_size);
+        VM_ASSERT(n >= 0);
+        ASSUME(n >= 0);
+        size_t pos = n; /* no overflow */
+        if (LIKELY(pos)) {
+            /* use pos-1 because PC points next instruction at the beginning of instruction */
+            pos--;
+        }
+#if VMDEBUG && defined(HAVE_BUILTIN___BUILTIN_TRAP)
+        else {
+            /* SDR() is not possible; that causes infinite loop. */
+            rb_print_backtrace();
+            __builtin_trap();
+        }
+#endif
+        return rb_iseq_line_no(iseq, pos);
+    }
 }
 
 int
 rb_vm_get_sourceline(const rb_control_frame_t *cfp)
 {
     if (VM_FRAME_RUBYFRAME_P(cfp) && cfp->iseq) {
-	return calc_lineno(cfp->iseq, cfp->pc);
+	const rb_iseq_t *iseq = cfp->iseq;
+	int line = calc_lineno(iseq, cfp->pc);
+	if (line != 0) {
+	    return line;
+	}
+	else {
+	    return FIX2INT(rb_iseq_first_lineno(iseq));
+	}
     }
     else {
 	return 0;
@@ -331,9 +368,8 @@ location_to_str(rb_backtrace_location_t *loc)
 	    lineno = location_lineno(loc->body.cfunc.prev_loc);
 	}
 	else {
-	    rb_thread_t *th = GET_THREAD();
-	    file = th->vm->progname;
-	    lineno = INT2FIX(0);
+	    file = GET_VM()->progname;
+            lineno = 0;
 	}
 	name = rb_id2str(loc->body.cfunc.mid);
 	break;
@@ -432,6 +468,12 @@ backtrace_each(const rb_execution_context_t *ec,
     const rb_control_frame_t *cfp;
     ptrdiff_t size, i;
 
+    // In the case the thread vm_stack or cfp is not initialized, there is no backtrace.
+    if (start_cfp == NULL) {
+        init(arg, 0);
+        return;
+    }
+
     /*                <- start_cfp (end control frame)
      *  top frame (dummy)
      *  top frame (dummy)
@@ -511,7 +553,7 @@ bt_iter_cfunc(void *ptr, const rb_control_frame_t *cfp, ID mid)
     loc->body.cfunc.prev_loc = arg->prev_loc;
 }
 
-VALUE
+MJIT_FUNC_EXPORTED VALUE
 rb_ec_backtrace_object(const rb_execution_context_t *ec)
 {
     struct bt_iter_arg arg;
@@ -586,6 +628,25 @@ rb_backtrace_to_str_ary(VALUE self)
     return bt->strary;
 }
 
+MJIT_FUNC_EXPORTED void
+rb_backtrace_use_iseq_first_lineno_for_last_location(VALUE self)
+{
+    const rb_backtrace_t *bt;
+    const rb_iseq_t *iseq;
+    rb_backtrace_location_t *loc;
+
+    GetCoreDataFromValue(self, rb_backtrace_t, bt);
+    VM_ASSERT(bt->backtrace_size > 0);
+
+    loc = &bt->backtrace[bt->backtrace_size - 1];
+    iseq = loc->body.iseq.iseq;
+
+    VM_ASSERT(loc->type == LOCATION_TYPE_ISEQ);
+
+    loc->body.iseq.lineno.lineno = FIX2INT(iseq->body->location.first_lineno);
+    loc->type = LOCATION_TYPE_ISEQ_CALCED;
+}
+
 static VALUE
 location_create(rb_backtrace_location_t *srcloc, void *btobj)
 {
@@ -655,8 +716,8 @@ rb_ec_backtrace_str_ary(const rb_execution_context_t *ec, long lev, long n)
     return backtrace_to_str_ary(rb_ec_backtrace_object(ec), lev, n);
 }
 
-VALUE
-rb_ec_backtrace_location_ary(const rb_execution_context_t *ec, long lev, long n)
+static VALUE
+ec_backtrace_location_ary(const rb_execution_context_t *ec, long lev, long n)
 {
     return backtrace_to_location_ary(rb_ec_backtrace_object(ec), lev, n);
 }
@@ -674,9 +735,7 @@ static void
 oldbt_init(void *ptr, size_t dmy)
 {
     struct oldbt_arg *arg = (struct oldbt_arg *)ptr;
-    rb_thread_t *th = GET_THREAD();
-
-    arg->filename = th->vm->progname;
+    arg->filename = GET_VM()->progname;
     arg->lineno = 0;
 }
 
@@ -1060,7 +1119,7 @@ RUBY_SYMBOL_EXPORT_BEGIN
 RUBY_SYMBOL_EXPORT_END
 
 struct rb_debug_inspector_struct {
-    rb_thread_t *th;
+    rb_execution_context_t *ec;
     rb_control_frame_t *cfp;
     VALUE backtrace;
     VALUE contexts; /* [[klass, binding, iseq, cfp], ...] */
@@ -1133,7 +1192,7 @@ collect_caller_bindings_cfunc(void *arg, const rb_control_frame_t *cfp, ID mid)
 }
 
 static VALUE
-collect_caller_bindings(rb_thread_t *th)
+collect_caller_bindings(const rb_execution_context_t *ec)
 {
     struct collect_caller_bindings_data data;
     VALUE result;
@@ -1141,7 +1200,7 @@ collect_caller_bindings(rb_thread_t *th)
 
     data.ary = rb_ary_new();
 
-    backtrace_each(th->ec,
+    backtrace_each(ec,
 		   collect_caller_bindings_init,
 		   collect_caller_bindings_iseq,
 		   collect_caller_bindings_cfunc,
@@ -1156,7 +1215,7 @@ collect_caller_bindings(rb_thread_t *th)
 
 	if (!NIL_P(cfp_val)) {
 	    rb_control_frame_t *cfp = GC_GUARDED_PTR_REF(cfp_val);
-	    rb_ary_store(entry, CALLER_BINDING_BINDING, rb_vm_make_binding(th->ec, cfp));
+	    rb_ary_store(entry, CALLER_BINDING_BINDING, rb_vm_make_binding(ec, cfp));
 	}
     }
 
@@ -1172,18 +1231,21 @@ VALUE
 rb_debug_inspector_open(rb_debug_inspector_func_t func, void *data)
 {
     rb_debug_inspector_t dbg_context;
-    rb_thread_t * volatile th = GET_THREAD();
+    rb_execution_context_t *ec = GET_EC();
     enum ruby_tag_type state;
     volatile VALUE MAYBE_UNUSED(result);
 
-    dbg_context.th = th;
-    dbg_context.cfp = dbg_context.th->ec->cfp;
-    dbg_context.backtrace = rb_ec_backtrace_location_ary(th->ec, 0, 0);
-    dbg_context.backtrace_size = RARRAY_LEN(dbg_context.backtrace);
-    dbg_context.contexts = collect_caller_bindings(th);
+    /* escape all env to heap */
+    rb_vm_stack_to_heap(ec);
 
-    EC_PUSH_TAG(th->ec);
-    if ((state = EXEC_TAG()) == TAG_NONE) {
+    dbg_context.ec = ec;
+    dbg_context.cfp = dbg_context.ec->cfp;
+    dbg_context.backtrace = ec_backtrace_location_ary(ec, 0, 0);
+    dbg_context.backtrace_size = RARRAY_LEN(dbg_context.backtrace);
+    dbg_context.contexts = collect_caller_bindings(ec);
+
+    EC_PUSH_TAG(ec);
+    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
 	result = (*func)(&dbg_context, data);
     }
     EC_POP_TAG();
@@ -1191,7 +1253,7 @@ rb_debug_inspector_open(rb_debug_inspector_func_t func, void *data)
     /* invalidate bindings? */
 
     if (state) {
-	EC_JUMP_TAG(th->ec, state);
+	EC_JUMP_TAG(ec, state);
     }
 
     return result;
@@ -1251,7 +1313,7 @@ rb_profile_frames(int start, int limit, VALUE *buff, int *lines)
     const rb_callable_method_entry_t *cme;
 
     for (i=0; i<limit && cfp != end_cfp;) {
-	if (cfp->iseq && cfp->pc) {
+        if (VM_FRAME_RUBYFRAME_P(cfp)) {
 	    if (start > 0) {
 		start--;
 		continue;
